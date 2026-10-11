@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deterministic-tts"
+version = "0.1.0"
+description = "Resumable local OCR and text-to-speech projects for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+local = [
+  "mlx-audio[tts]==0.5.8",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+tts-project = "deterministic_tts.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+deterministic_tts = ["vision_ocr.m"]
+
