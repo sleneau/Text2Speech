@@ -15,6 +15,9 @@ from .util import load_json
 DEFAULTS: dict[str, Any] = {
     "tts_backend": "kokoro",
     "ocr_backend": "auto",
+    "pdf_mode": "auto",
+    "pdf_dpi": 300,
+    "pdf_cleanup": "headers-footers",
     "voice": "af_heart",
     "model": None,
     "language": None,
@@ -37,13 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   tts-project chapter.txt --project-name chapter
   tts-project scans/ --project-name scanned-book
+  tts-project scanned-book.pdf --project-name scanned-pdf
   tts-project page01.png
   tts-project projects/scanned-book
   tts-project chapter.txt --tts-backend chatterbox --reference-audio voice.wav
 
 Input may be a UTF-8/16/32 text file, one image, a folder whose direct children
-are images, or an existing project folder. Image names are naturally ordered
-(page2 before page10). Project settings are frozen when the project is created.
+are images, a PDF, or an existing project folder. Image names are naturally
+ordered (page2 before page10). Project settings are frozen when the project is
+created.
 """,
     )
     parser.add_argument("input", nargs="?", type=Path, help="source path or existing project path")
@@ -58,6 +63,18 @@ are images, or an existing project folder. Image names are naturally ordered
     parser.add_argument(
         "--ocr-backend", choices=("auto", "vision", "tesseract"), default=None,
         help="image OCR engine (default: Apple Vision on macOS)",
+    )
+    parser.add_argument(
+        "--pdf-mode", choices=("auto", "text", "ocr"), default=None,
+        help="PDF extraction mode (default: auto; embedded text with per-page OCR fallback)",
+    )
+    parser.add_argument(
+        "--pdf-dpi", type=int, default=None,
+        help="PDF page render resolution for OCR, 72-600 (default: 300)",
+    )
+    parser.add_argument(
+        "--pdf-cleanup", choices=("headers-footers", "none"), default=None,
+        help="remove repeated PDF headers, footers, and page numbers (default: headers-footers)",
     )
     parser.add_argument("--voice", default=None, help="Kokoro voice ID (default: af_heart)")
     parser.add_argument("--model", default=None, help="override the Hugging Face MLX model ID")
@@ -99,7 +116,7 @@ def doctor_text() -> str:
         f"  Apple Silicon    : {'OK' if system == 'Darwin' and machine == 'arm64' else 'MLX unavailable'} ({system} {machine})",
         f"  MLX-Audio        : {'OK ' + mlx_version if mlx_version else 'MISSING (needed for Kokoro/Chatterbox)'}",
         f"  FFmpeg           : {'OK ' + ffmpeg if ffmpeg else 'MISSING (needed for MP3)'}",
-        f"  Apple Vision OCR : {'OK via ' + xcrun if system == 'Darwin' and xcrun else 'UNAVAILABLE'}",
+        f"  Vision + PDFKit  : {'OK via ' + xcrun if system == 'Darwin' and xcrun else 'UNAVAILABLE'}",
         f"  Tesseract OCR    : {'OK ' + tesseract if tesseract else 'not installed (optional fallback)'}",
     ]
     return "\n".join(statuses)
@@ -117,10 +134,13 @@ Local stack
 macOS setup (from this directory)
   /Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11 -m venv .venv
   .venv/bin/pip install -e '.[local]'
+  .venv/bin/pip install 'misaki[en]==0.9.4'
+  .venv/bin/python -m spacy download en_core_web_sm
   brew install ffmpeg
 
-Apple Vision OCR ships with macOS and is compiled through Xcode Command Line
-Tools. If `xcrun` is missing, run: xcode-select --install
+Apple Vision OCR and PDFKit ship with macOS; their local helpers are compiled
+through Xcode Command Line Tools. If `xcrun` is missing, run:
+  xcode-select --install
 Optional Tesseract fallback: brew install tesseract
 
 Technology references
@@ -151,6 +171,8 @@ def _new_settings(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("--chunk-chars must be between 100 and 1000")
     if not 0 <= settings["pause_ms"] <= 5000:
         raise RuntimeError("--pause-ms must be between 0 and 5000")
+    if not 72 <= settings["pdf_dpi"] <= 600:
+        raise RuntimeError("--pdf-dpi must be between 72 and 600")
     if not settings["mp3_bitrate"].endswith("k") or not settings["mp3_bitrate"][:-1].isdigit():
         raise RuntimeError("--mp3-bitrate must look like 128k or 192k")
     return settings

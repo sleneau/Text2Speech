@@ -28,5 +28,5 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-deterministic_tts = ["vision_ocr.m"]
+deterministic_tts = ["pdf_helper.m", "vision_ocr.m"]
 

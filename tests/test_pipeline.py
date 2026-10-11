@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from deterministic_tts.pdf import clean_pdf_body_pages
 from deterministic_tts.pipeline import ProjectPipeline, create_project
 from deterministic_tts.text import chunk_text, normalize_text
 from deterministic_tts.util import natural_key, sha256_file
@@ -15,6 +16,9 @@ def test_settings() -> dict[str, object]:
     return {
         "tts_backend": "test-tone",
         "ocr_backend": "auto",
+        "pdf_mode": "auto",
+        "pdf_dpi": 300,
+        "pdf_cleanup": "headers-footers",
         "voice": "af_heart",
         "model": None,
         "language": "a",
@@ -30,6 +34,36 @@ def test_settings() -> dict[str, object]:
 
 
 class TextTests(unittest.TestCase):
+    def test_pdf_margin_cleanup_removes_repeated_lines_and_page_numbers(self) -> None:
+        pages = [
+            "Example Book\nFirst unique body paragraph.\nConfidential\n1\n",
+            "Example Book\nSecond unique body paragraph.\nConfidential\n2\n",
+            "Example Book\nThird unique body paragraph.\nConfidential\n3\n",
+        ]
+        cleaned, removals = clean_pdf_body_pages(pages)
+        self.assertEqual(
+            cleaned,
+            [
+                "First unique body paragraph.\n",
+                "Second unique body paragraph.\n",
+                "Third unique body paragraph.\n",
+            ],
+        )
+        self.assertEqual(len(removals), 9)
+        self.assertEqual(
+            {item["reason"] for item in removals},
+            {"repeated_header", "repeated_footer", "page_number"},
+        )
+
+    def test_pdf_margin_cleanup_keeps_ambiguous_roman_heading(self) -> None:
+        cleaned, removals = clean_pdf_body_pages(["Part I\n"])
+        self.assertEqual(cleaned, ["Part I\n"])
+        self.assertEqual(removals, [])
+
+        cleaned, removals = clean_pdf_body_pages(["A short body line.\n12\n"])
+        self.assertEqual(cleaned, ["A short body line.\n"])
+        self.assertEqual(removals[0]["reason"], "page_number")
+
     def test_natural_order(self) -> None:
         values = [Path("page10.png"), Path("page2.png"), Path("page1.png")]
         self.assertEqual([item.name for item in sorted(values, key=natural_key)], ["page1.png", "page2.png", "page10.png"])
@@ -44,6 +78,82 @@ class TextTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_pdf_embedded_text_resumes_at_first_unfinished_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.pdf"
+            source.write_bytes(b"%PDF-1.7 fake test fixture")
+            settings = test_settings()
+            settings["pdf_mode"] = "text"
+            project = create_project(source, root / "projects", "pdf-text", settings, None)
+
+            with (
+                patch("deterministic_tts.pipeline.pdf_info", return_value={"page_count": 2}),
+                patch(
+                    "deterministic_tts.pipeline.pdf_page_text",
+                    side_effect=["Embedded text from page one.", RuntimeError("stopped")],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stopped"):
+                    ProjectPipeline(project, progress=False).run()
+
+            self.assertEqual(
+                (project / "text/pages/0001.txt").read_text(encoding="utf-8"),
+                "Embedded text from page one.\n",
+            )
+            with (
+                patch("deterministic_tts.pipeline.pdf_info", return_value={"page_count": 2}),
+                patch(
+                    "deterministic_tts.pipeline.pdf_page_text",
+                    return_value="Embedded text from page two.",
+                ) as extract_page,
+            ):
+                output = ProjectPipeline(project, progress=False).run()
+
+            self.assertTrue(output.is_file())
+            extract_page.assert_called_once()
+            self.assertEqual(extract_page.call_args.args[1], 1)
+            self.assertEqual(
+                (project / "text/extracted.txt").read_text(encoding="utf-8"),
+                "Embedded text from page one.\n\nEmbedded text from page two.\n",
+            )
+            ledger = json.loads((project / "ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["stages"]["extract"]["pages"]["0001"]["extraction_method"], "embedded_text")
+            self.assertEqual(ledger["stages"]["extract"]["pages"]["0002"]["extraction_method"], "embedded_text")
+
+    def test_pdf_auto_mode_uses_ocr_for_a_page_without_usable_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "scan.pdf"
+            source.write_bytes(b"%PDF-1.7 fake test fixture")
+            settings = test_settings()
+            settings["ocr_backend"] = "tesseract"
+            project = create_project(source, root / "projects", "pdf-ocr", settings, None)
+
+            def render_page(
+                _source: Path, _page_index: int, output: Path, _dpi: int, _cache: Path
+            ) -> None:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"fake png")
+
+            with (
+                patch("deterministic_tts.pipeline.pdf_info", return_value={"page_count": 1}),
+                patch("deterministic_tts.pipeline.pdf_page_text", return_value=""),
+                patch("deterministic_tts.pipeline.pdf_render_page", side_effect=render_page) as render,
+                patch(
+                    "deterministic_tts.pipeline.extract_image_text",
+                    return_value="Text recovered from the scanned PDF page.",
+                ) as ocr,
+            ):
+                output = ProjectPipeline(project, progress=False).run()
+
+            self.assertTrue(output.is_file())
+            render.assert_called_once()
+            ocr.assert_called_once()
+            self.assertFalse((project / ".cache/pdf-pages/0001.png").exists())
+            ledger = json.loads((project / "ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["stages"]["extract"]["pages"]["0001"]["extraction_method"], "ocr")
+
     def test_end_to_end_resume_and_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

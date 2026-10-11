@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,13 @@ from typing import Any
 from .audio import combine_wavs, encode_mp3
 from .backends import make_backend
 from .ocr import extract_image_text, resolve_ocr_backend
+from .pdf import (
+    PDF_EXTRACTOR_VERSION,
+    clean_pdf_body_pages,
+    pdf_info,
+    pdf_page_text,
+    pdf_render_page,
+)
 from .text import chunk_text, decode_text_file, normalize_text
 from .util import (
     artifact,
@@ -26,6 +34,7 @@ from .util import (
 SCHEMA_VERSION = 1
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 TEXT_EXTENSIONS = {".csv", ".md", ".rst", ".text", ".txt"}
+PDF_EXTENSIONS = {".pdf"}
 
 
 def is_project(path: Path) -> bool:
@@ -37,11 +46,13 @@ def _classify_source(path: Path) -> tuple[str, list[Path]]:
         suffix = path.suffix.casefold()
         if suffix in IMAGE_EXTENSIONS:
             return "images", [path]
+        if suffix in PDF_EXTENSIONS:
+            return "pdf", [path]
         if suffix in TEXT_EXTENSIONS:
             return "text", [path]
         raise RuntimeError(
             f"Unsupported input file {path.name!r}. Text: {sorted(TEXT_EXTENSIONS)}; "
-            f"images: {sorted(IMAGE_EXTENSIONS)}"
+            f"images: {sorted(IMAGE_EXTENSIONS)}; PDF: {sorted(PDF_EXTENSIONS)}"
         )
     if path.is_dir():
         images = sorted(
@@ -81,7 +92,9 @@ def create_project(
             "or choose a different --project-name."
         )
 
-    if source_type == "images":
+    if source_type == "images" or (
+        source_type == "pdf" and settings.get("pdf_mode", "auto") in {"auto", "ocr"}
+    ):
         settings["ocr_backend"] = resolve_ocr_backend(settings["ocr_backend"])
     if settings["tts_backend"] == "chatterbox" and reference_audio is None:
         raise RuntimeError("--reference-audio is required when --tts-backend chatterbox is selected")
@@ -91,7 +104,7 @@ def create_project(
         destination_name = f"{index:04d}--{origin.name}"
         records.append(
             {
-                "kind": "image" if source_type == "images" else "text",
+                "kind": {"images": "image", "pdf": "pdf", "text": "text"}[source_type],
                 "order": index,
                 "origin": str(origin),
                 "path": f"source/{destination_name}",
@@ -115,7 +128,14 @@ def create_project(
         settings["reference_audio_project_path"] = reference_record["path"]
 
     project_dir.mkdir(parents=True)
-    for relative in ("source", "text/pages", "text/chunks", "audio/chunks", ".cache"):
+    for relative in (
+        "source",
+        "text/pages",
+        "text/body-pages",
+        "text/chunks",
+        "audio/chunks",
+        ".cache",
+    ):
         (project_dir / relative).mkdir(parents=True, exist_ok=True)
 
     config = {
@@ -207,7 +227,157 @@ class ProjectPipeline:
             copied.append(artifact(destination, self.project_dir))
         self._stage("ingest", "complete", artifacts=copied)
 
+    @staticmethod
+    def _pdf_text_is_usable(value: str) -> bool:
+        visible = "".join(character for character in value if not character.isspace())
+        words = re.findall(r"\w+", value, flags=re.UNICODE)
+        return len(visible) >= 30 and len(words) >= 3
+
+    def _extract_pdf(self) -> Path:
+        stage = self.ledger.get("stages", {}).get("extract", {})
+        source_record = self.config["sources"][0]
+        mode = self.settings.get("pdf_mode", "auto")
+        dpi = int(self.settings.get("pdf_dpi", 300))
+        cleanup_mode = self.settings.get("pdf_cleanup", "headers-footers")
+        extraction_fingerprint = stable_hash(
+            {
+                "source_sha256": source_record["sha256"],
+                "pdf_mode": mode,
+                "pdf_dpi": dpi,
+                "pdf_cleanup": cleanup_mode,
+                "ocr_backend": self.settings.get("ocr_backend"),
+                "ocr_language": self.settings.get("ocr_language"),
+                "extractor_version": PDF_EXTRACTOR_VERSION,
+            }
+        )
+        if (
+            stage.get("status") == "complete"
+            and stage.get("input_fingerprint") == extraction_fingerprint
+            and artifacts_valid(stage.get("artifacts", []), self.project_dir)
+        ):
+            self._say("[skip] PDF text extraction is already complete")
+            return self.project_dir / "text/extracted.txt"
+
+        source_path = self.project_dir / source_record["path"]
+        cache_dir = self.project_dir / ".cache"
+        page_count = int(pdf_info(source_path, cache_dir)["page_count"])
+
+        self._say(f"[run ] extracting {page_count} PDF pages ({mode} mode)")
+        self._stage(
+            "extract",
+            "in_progress",
+            pages=stage.get("pages", {}),
+            page_count=page_count,
+            pdf_mode=mode,
+            pdf_cleanup=cleanup_mode,
+            extractor_version=PDF_EXTRACTOR_VERSION,
+            input_fingerprint=extraction_fingerprint,
+        )
+        page_records = self.ledger["stages"]["extract"].setdefault("pages", {})
+        page_paths: list[Path] = []
+        render_dir = self.project_dir / ".cache/pdf-pages"
+
+        for page_index in range(page_count):
+            page_number = page_index + 1
+            page_id = f"{page_number:04d}"
+            page_path = self.project_dir / f"text/pages/{page_id}.txt"
+            page_fingerprint = stable_hash(
+                {
+                    "source_sha256": source_record["sha256"],
+                    "page": page_number,
+                    "pdf_mode": mode,
+                    "pdf_dpi": dpi,
+                    "ocr_backend": self.settings.get("ocr_backend"),
+                    "ocr_language": self.settings.get("ocr_language"),
+                    "extractor": "pdfkit-v1",
+                }
+            )
+            prior = page_records.get(page_id, {})
+            valid = (
+                prior.get("input_fingerprint") == page_fingerprint
+                and artifacts_valid([prior.get("artifact", {})], self.project_dir)
+            )
+            if not valid:
+                embedded_text = pdf_page_text(source_path, page_index, cache_dir)
+                if mode == "text":
+                    if not embedded_text.strip():
+                        raise RuntimeError(
+                            f"PDF page {page_number} has no embedded text. "
+                            "Use --pdf-mode auto or --pdf-mode ocr in a new project."
+                        )
+                    value = embedded_text
+                    method = "embedded_text"
+                    self._say(f"       PDF text page {page_number}/{page_count}")
+                elif mode == "auto" and self._pdf_text_is_usable(embedded_text):
+                    value = embedded_text
+                    method = "embedded_text"
+                    self._say(f"       PDF text page {page_number}/{page_count}")
+                else:
+                    method = "ocr"
+                    rendered = render_dir / f"{page_id}.png"
+                    self._say(f"       PDF OCR page {page_number}/{page_count}")
+                    try:
+                        pdf_render_page(source_path, page_index, rendered, dpi, cache_dir)
+                        value = extract_image_text(
+                            rendered,
+                            self.settings["ocr_backend"],
+                            self.settings["ocr_language"],
+                            cache_dir,
+                        )
+                    finally:
+                        rendered.unlink(missing_ok=True)
+
+                atomic_write_text(page_path, value.strip() + "\n")
+                page_records[page_id] = {
+                    "page_number": page_number,
+                    "input_fingerprint": page_fingerprint,
+                    "extraction_method": method,
+                    "artifact": artifact(page_path, self.project_dir),
+                }
+                self._save()
+            page_paths.append(page_path)
+
+        raw_pages = [path.read_text(encoding="utf-8") for path in page_paths]
+        if cleanup_mode == "headers-footers":
+            body_pages, removals = clean_pdf_body_pages(raw_pages)
+        else:
+            body_pages, removals = raw_pages, []
+
+        body_paths: list[Path] = []
+        for page_number, value in enumerate(body_pages, 1):
+            body_path = self.project_dir / f"text/body-pages/{page_number:04d}.txt"
+            atomic_write_text(body_path, value)
+            body_paths.append(body_path)
+            page_records[f"{page_number:04d}"]["body_artifact"] = artifact(
+                body_path, self.project_dir
+            )
+            page_records[f"{page_number:04d}"]["removed_margin_lines"] = [
+                removal for removal in removals if removal["page_number"] == page_number
+            ]
+
+        combined = "\n\n".join(value.strip() for value in body_pages).strip() + "\n"
+        extracted = self.project_dir / "text/extracted.txt"
+        atomic_write_text(extracted, combined)
+        artifacts = [artifact(path, self.project_dir) for path in page_paths]
+        artifacts.extend(artifact(path, self.project_dir) for path in body_paths)
+        artifacts.append(artifact(extracted, self.project_dir))
+        self._stage(
+            "extract",
+            "complete",
+            artifacts=artifacts,
+            pages=page_records,
+            page_count=page_count,
+            pdf_mode=mode,
+            pdf_cleanup=cleanup_mode,
+            removed_margin_lines=removals,
+            extractor_version=PDF_EXTRACTOR_VERSION,
+            input_fingerprint=extraction_fingerprint,
+        )
+        return extracted
+
     def _extract(self) -> Path:
+        if self.config.get("source_type") == "pdf":
+            return self._extract_pdf()
         stage = self.ledger.get("stages", {}).get("extract", {})
         if stage.get("status") == "complete" and artifacts_valid(stage.get("artifacts", []), self.project_dir):
             self._say("[skip] text extraction is already complete")

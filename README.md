@@ -1,11 +1,12 @@
 # Local OCR and Text-to-Speech Pipeline
 
 This repository provides a deterministic, resumable command-line workflow that
-turns plain text or ordered page images into one high-quality MP3.
+turns plain text, PDFs, or ordered page images into one high-quality MP3.
 
 It is designed for Apple Silicon Macs and uses:
 
 - [Apple Vision](https://developer.apple.com/documentation/vision) for local OCR.
+- [PDFKit](https://developer.apple.com/documentation/pdfkit) for local PDF text extraction and rendering.
 - [MLX-Audio](https://github.com/Blaizzy/mlx-audio) for local speech synthesis.
 - [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) as the default voice model.
 - [Chatterbox](https://github.com/resemble-ai/chatterbox) for optional voice cloning.
@@ -16,11 +17,13 @@ have been downloaded, the OCR and speech pipeline can run offline.
 
 ## Features
 
-- Accepts a text file, one image, or a folder of ordered images.
+- Accepts a text file, one image, a folder of ordered images, or a PDF.
+- Extracts embedded PDF text and falls back to OCR page-by-page when needed.
+- Removes repeated PDF headers, footers, and page numbers by default.
 - Preserves byte-for-byte copies of the original source material.
-- Saves per-page OCR results and the exact text sent to the speech model.
+- Saves per-page extraction results and the exact text sent to the speech model.
 - Sorts image folders naturally: `page2.jpg` precedes `page10.jpg`.
-- Checkpoints OCR page-by-page and speech chunk-by-chunk.
+- Checkpoints extraction page-by-page and speech chunk-by-chunk.
 - Uses an atomic JSON ledger with SHA-256 artifact verification.
 - Resumes interrupted projects without repeating completed work.
 - Produces one normalized MP3 as the final audio output.
@@ -31,7 +34,7 @@ have been downloaded, the OCR and speech pipeline can run offline.
 
 - macOS on Apple Silicon.
 - Python 3.11 through 3.13; Python 3.11 is recommended.
-- Xcode Command Line Tools for the Apple Vision OCR bridge.
+- Xcode Command Line Tools for the Apple Vision OCR and PDFKit bridges.
 - FFmpeg compiled with `libmp3lame`.
 - Internet access during package installation and the first model download.
 - Sufficient free disk space for model weights and temporary PCM audio.
@@ -65,8 +68,8 @@ Install FFmpeg if it is not already available:
 brew install ffmpeg
 ```
 
-Apple Vision is built into macOS. If `xcrun` is unavailable, install Apple's
-command-line tools:
+Apple Vision and PDFKit are built into macOS. If `xcrun` is unavailable, install
+Apple's command-line tools:
 
 ```sh
 xcode-select --install
@@ -105,6 +108,24 @@ Create a project from one image:
 .venv/bin/tts-project page01.png --project-name single-page
 ```
 
+Create a project from a PDF, using embedded text where available and OCR for
+scanned pages:
+
+```sh
+.venv/bin/tts-project scanned-book.pdf --project-name scanned-pdf
+```
+
+For a scanned PDF with small print, force OCR at 400 DPI while retaining the
+default header/footer cleanup:
+
+```sh
+.venv/bin/tts-project scanned-book.pdf \
+  --project-name scanned-pdf-400dpi \
+  --pdf-mode ocr \
+  --pdf-dpi 400 \
+  --pdf-cleanup headers-footers
+```
+
 The first Kokoro run downloads `mlx-community/Kokoro-82M-bf16` from Hugging
 Face. Later projects reuse the cached model.
 
@@ -128,18 +149,18 @@ instructions, and dependency status:
 | Text | `.txt`, `.text`, `.md`, `.rst`, `.csv` | Decoded as UTF-8, UTF-16, or UTF-32 |
 | Image | `.bmp`, `.gif`, `.heic`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp` | OCR produces one page text file |
 | Image folder | Direct child images using the extensions above | Images are naturally sorted and processed in order |
+| PDF | `.pdf` | Page-by-page embedded-text extraction with optional OCR fallback |
 | Existing project | Directory containing `project.json` and `ledger.json` | Work resumes from verified checkpoints |
 
-Image-folder discovery is intentionally non-recursive. PDFs and word-processing
-documents are not currently accepted directly; convert them to plain text or page
-images first.
+Image-folder discovery is intentionally non-recursive. Word-processing documents
+are not currently accepted directly; convert them to plain text or PDF first.
 
 ## Pipeline
 
 | Stage | Result | Resume behavior |
 |---|---|---|
 | Ingest | Original inputs copied into `source/` | Copied files are hash-verified |
-| Extract | Decoded text or one OCR text file per image | Completed OCR pages are skipped |
+| Extract | Decoded text or one text file per image/PDF page, with PDF margin cleanup | Completed pages are skipped |
 | Normalize | Unicode and whitespace cleanup | Reused while its input hash matches |
 | Chunk | Sentence-aware TTS chunks | Exact chunk text is preserved |
 | Render | One temporary PCM WAV per chunk | Completed chunks survive interruptions |
@@ -159,7 +180,8 @@ projects/<project_name>/
 ├── ledger.json              # stage state, chunk state, timestamps, and hashes
 ├── source/                  # byte-for-byte copies of original inputs
 ├── text/
-│   ├── pages/               # decoded or OCR text for each source page
+│   ├── pages/               # decoded, embedded, or OCR text for each source page
+│   ├── body-pages/          # PDF pages after deterministic margin cleanup
 │   ├── extracted.txt        # pages combined in deterministic order
 │   ├── normalized.txt       # normalized full text
 │   └── chunks/              # exact text submitted to the TTS model
@@ -192,14 +214,15 @@ Inspect a project's ledger without starting work:
 
 If a run is interrupted:
 
-- Completed OCR pages are retained.
+- Completed image and PDF pages are retained.
 - Completed speech WAV chunks are retained.
 - The next run verifies hashes before skipping anything.
 - Working WAV files are deleted once the final MP3 is complete.
 - A completed project does not recreate WAV files when resumed.
 
-Project synthesis settings are frozen at creation. Create a new project if you
-want to change the voice, model, language, speed, chunk size, or audio settings.
+Project extraction and synthesis settings are frozen at creation. Create a new
+project if you want to change the PDF mode, OCR settings, voice, model, language,
+speed, chunk size, or audio settings.
 
 ## Model downloads and caching
 
@@ -286,6 +309,67 @@ brew install tesseract
 For Apple Vision, use language identifiers such as `en-US`. For Tesseract, use
 installed language names such as `eng`.
 
+## PDF extraction
+
+PDFs are processed one page at a time through macOS PDFKit. The original PDF is
+preserved in the project's `source/` directory. Each raw extracted page is saved
+under `text/pages/`, its narration-ready version is saved under
+`text/body-pages/`, and both are checkpointed in `ledger.json`.
+
+Choose the extraction behavior when creating the project:
+
+```sh
+# Recommended: embedded text when usable, otherwise OCR that page
+.venv/bin/tts-project book.pdf --project-name book --pdf-mode auto
+
+# Require embedded text on every page; never invoke OCR
+.venv/bin/tts-project book.pdf --project-name book-text --pdf-mode text
+
+# Render and OCR every page, ignoring any embedded text layer
+.venv/bin/tts-project book.pdf --project-name book-ocr --pdf-mode ocr
+```
+
+The PDF-specific options are:
+
+| Option | Accepted values | Default | Effect |
+|---|---|---|---|
+| `--pdf-mode` | `auto`, `text`, `ocr` | `auto` | Chooses embedded text, per-page automatic fallback, or OCR for every page |
+| `--pdf-dpi` | `72`–`600` | `300` | Sets the page-rendering resolution used when OCR runs |
+| `--pdf-cleanup` | `headers-footers`, `none` | `headers-footers` | Removes repeated margin lines and page numbers, or preserves every extracted line |
+
+These options are saved in `project.json` when the project is created. They
+cannot be changed while resuming that project; create a new project to use
+different PDF settings.
+
+In `auto` mode, a page with at least 30 non-whitespace characters and three
+words is treated as having usable embedded text. Other pages are rendered to a
+temporary PNG and passed to the selected OCR backend. The PNG is deleted after
+that page is extracted. Set the OCR render resolution with `--pdf-dpi`; the
+default is 300 DPI and the allowed range is 72–600.
+
+Encrypted or password-protected PDFs are rejected. Decrypt the document to a
+new PDF before creating a project.
+
+### Headers, footers, and body text
+
+By default, `--pdf-cleanup headers-footers` removes standalone page numbers and
+lines that occur in the same top or bottom margin on at least three pages. Digit
+runs are normalized during comparison, so changing page numbers in a repeated
+line do not prevent detection. Every removed line, page number, location, and
+reason is recorded in `ledger.json`; the untouched extracted pages remain under
+`text/pages/` for review.
+
+This is intentionally conservative. A deterministic rule cannot reliably tell
+whether a unique footnote, figure caption, sidebar, table of contents entry, or
+other one-off element belongs in the narration. Those elements are retained. To
+disable all automatic margin removal, create the project with:
+
+```sh
+.venv/bin/tts-project book.pdf \
+  --project-name book-verbatim \
+  --pdf-cleanup none
+```
+
 ## Common options
 
 | Option | Default | Purpose |
@@ -294,6 +378,9 @@ installed language names such as `eng`.
 | `--projects-dir PATH` | `./projects` | Alternate project root |
 | `--tts-backend` | `kokoro` | `kokoro`, `chatterbox`, or `test-tone` |
 | `--ocr-backend` | `auto` | `auto`, `vision`, or `tesseract` |
+| `--pdf-mode` | `auto` | `auto`, embedded `text` only, or `ocr` every page |
+| `--pdf-dpi` | `300` | PDF rendering resolution for OCR, from `72` to `600` |
+| `--pdf-cleanup` | `headers-footers` | Remove repeated margins, or use `none` |
 | `--voice` | `af_heart` | Kokoro voice preset |
 | `--language` | `a` or `en` | TTS language code |
 | `--ocr-language` | `en-US` | OCR language identifier |
@@ -345,6 +432,24 @@ Confirm that `xcrun clang --version` works. If Vision remains unavailable, insta
 Tesseract and create a new project with `--ocr-backend tesseract`. OCR settings are
 frozen once a project is created.
 
+### PDF is encrypted or password-protected
+
+PDFKit processing deliberately rejects encrypted PDFs, even when the document
+can be opened without an interactive password prompt. Save or print an
+unencrypted copy, then create a project from that copy.
+
+### PDF text is missing or garbled
+
+Create a new project with `--pdf-mode ocr` to ignore the PDF's embedded text
+layer. For small type, increase `--pdf-dpi` from 300 to 400; higher resolutions
+use more time and temporary memory.
+
+### PDF cleanup removed body text
+
+The raw page extraction is still available under `text/pages/`, and every
+removal is listed in `ledger.json`. Create a new project with
+`--pdf-cleanup none` to retain every extracted line in the narration.
+
 ### Preserved source was modified
 
 The copy under the project's `source/` directory no longer matches its ledger
@@ -370,9 +475,10 @@ Run the standard-library test suite:
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The tests cover text normalization, natural filename ordering, end-to-end MP3
-creation, interruption recovery, final WAV cleanup, source-integrity protection,
-and preservation of a uniquely renamed final MP3.
+The tests cover text normalization, natural filename ordering, embedded-text PDF
+extraction, PDF OCR fallback, page-level interruption recovery, end-to-end MP3
+creation, final WAV cleanup, source-integrity protection, and preservation of a
+uniquely renamed final MP3.
 
 ## License
 
