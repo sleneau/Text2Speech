@@ -23,7 +23,8 @@ DEFAULTS: dict[str, Any] = {
     "language": None,
     "ocr_language": "en-US",
     "speed": 1.0,
-    "chunk_chars": 350,
+    "chunk_mode": "paragraph",
+    "chunk_chars": 2500,
     "pause_ms": 250,
     "mp3_bitrate": "128k",
     "exaggeration": 0.5,
@@ -85,7 +86,14 @@ created.
     parser.add_argument("--ocr-language", default=None, help="OCR language (default: en-US)")
     parser.add_argument("--speed", type=float, default=None, help="Kokoro speaking speed (default: 1.0)")
     parser.add_argument("--reference-audio", type=Path, help="voice reference required by Chatterbox")
-    parser.add_argument("--chunk-chars", type=int, default=None, help="target chunk size (default: 350)")
+    parser.add_argument(
+        "--chunk-mode", choices=("paragraph", "target"), default=None,
+        help="paragraph-first or legacy target-size chunking (default: paragraph)",
+    )
+    parser.add_argument(
+        "--chunk-chars", type=int, default=None,
+        help="maximum paragraph chunk size, 100-3000 (default: 2500)",
+    )
     parser.add_argument("--pause-ms", type=int, default=None, help="silence between chunks (default: 250)")
     parser.add_argument("--mp3-bitrate", default=None, help="FFmpeg MP3 bitrate (default: 128k)")
     parser.add_argument("--exaggeration", type=float, default=None, help="Chatterbox expressiveness (default: 0.5)")
@@ -167,8 +175,8 @@ def _new_settings(args: argparse.Namespace) -> dict[str, Any]:
         settings["language"] = "en" if backend == "chatterbox" else "a"
     if not 0.25 <= settings["speed"] <= 4.0:
         raise RuntimeError("--speed must be between 0.25 and 4.0")
-    if not 100 <= settings["chunk_chars"] <= 1000:
-        raise RuntimeError("--chunk-chars must be between 100 and 1000")
+    if not 100 <= settings["chunk_chars"] <= 3000:
+        raise RuntimeError("--chunk-chars must be between 100 and 3000")
     if not 0 <= settings["pause_ms"] <= 5000:
         raise RuntimeError("--pause-ms must be between 0 and 5000")
     if not 72 <= settings["pdf_dpi"] <= 600:

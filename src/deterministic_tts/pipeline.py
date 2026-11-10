@@ -6,8 +6,14 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .audio import combine_wavs, encode_mp3
-from .backends import make_backend
+from .audio import combine_wavs, encode_mp3, wav_metrics
+from .backends import (
+    QWEN_VALIDATION_POLICY,
+    RenderMetrics,
+    SpeechValidationError,
+    make_backend,
+    spoken_word_count,
+)
 from .ocr import extract_image_text, resolve_ocr_backend
 from .pdf import (
     PDF_EXTRACTOR_VERSION,
@@ -16,7 +22,14 @@ from .pdf import (
     pdf_page_text,
     pdf_render_page,
 )
-from .text import chunk_text, decode_text_file, normalize_text
+from .text import (
+    TERMINAL_ELLIPSIS_POLICY,
+    chunk_text,
+    decode_text_file,
+    normalize_terminal_ellipsis,
+    normalize_text,
+    split_text_for_retry,
+)
 from .util import (
     artifact,
     artifacts_valid,
@@ -35,6 +48,7 @@ SCHEMA_VERSION = 1
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 TEXT_EXTENSIONS = {".csv", ".md", ".rst", ".text", ".txt"}
 PDF_EXTENSIONS = {".pdf"}
+FALLBACK_POLICY = "sentence-split-on-validation-failure-v1"
 
 
 def is_project(path: Path) -> bool:
@@ -81,6 +95,7 @@ def create_project(
     project_name: str | None,
     settings: dict[str, Any],
     reference_audio: Path | None,
+    reference_text: str | None = None,
 ) -> Path:
     source = source.expanduser().resolve()
     source_type, source_paths = _classify_source(source)
@@ -98,6 +113,12 @@ def create_project(
         settings["ocr_backend"] = resolve_ocr_backend(settings["ocr_backend"])
     if settings["tts_backend"] == "chatterbox" and reference_audio is None:
         raise RuntimeError("--reference-audio is required when --tts-backend chatterbox is selected")
+    if settings["tts_backend"] == "qwen3":
+        if reference_audio is None:
+            raise RuntimeError("Qwen3-TTS requires a prepared reference recording")
+        if not reference_text or not reference_text.strip():
+            raise RuntimeError("Qwen3-TTS requires the exact reference transcript")
+        settings["reference_text"] = " ".join(reference_text.split())
 
     records: list[dict[str, Any]] = []
     for index, origin in enumerate(source_paths, 1):
@@ -444,8 +465,16 @@ class ProjectPipeline:
 
     def _plan_chunks(self, normalized: Path) -> list[Path]:
         stage = self.ledger.get("stages", {}).get("chunk", {})
+        chunk_mode = self.settings.get("chunk_mode", "target")
+        terminal_ellipsis = self.settings.get("terminal_ellipsis", "preserve")
         fingerprint = stable_hash(
-            {"text": sha256_file(normalized), "chunk_chars": self.settings["chunk_chars"]}
+            {
+                "text": sha256_file(normalized),
+                "chunk_mode": chunk_mode,
+                "chunk_chars": self.settings["chunk_chars"],
+                "terminal_ellipsis": terminal_ellipsis,
+                "terminal_ellipsis_policy": TERMINAL_ELLIPSIS_POLICY,
+            }
         )
         if (
             stage.get("status") == "complete"
@@ -457,7 +486,18 @@ class ProjectPipeline:
 
         self._say("[run ] planning speech chunks")
         self._stage("chunk", "in_progress", input_fingerprint=fingerprint)
-        values = chunk_text(normalized.read_text(encoding="utf-8"), self.settings["chunk_chars"])
+        raw_values = chunk_text(
+            normalized.read_text(encoding="utf-8"),
+            self.settings["chunk_chars"],
+            mode=chunk_mode,
+        )
+        values = [
+            normalize_terminal_ellipsis(value, terminal_ellipsis)
+            for value in raw_values
+        ]
+        terminal_ellipsis_replacements = sum(
+            original != prepared for original, prepared in zip(raw_values, values)
+        )
         if not values:
             raise RuntimeError("The extracted text is empty; there is nothing to synthesize")
         paths: list[Path] = []
@@ -465,8 +505,20 @@ class ProjectPipeline:
             path = self.project_dir / f"text/chunks/{index:04d}.txt"
             atomic_write_text(path, value)
             paths.append(path)
-        records = [artifact(path, self.project_dir) for path in paths]
-        self._stage("chunk", "complete", input_fingerprint=fingerprint, artifacts=records)
+        records = []
+        for path, value in zip(paths, values):
+            record = artifact(path, self.project_dir)
+            record["characters"] = len(value.rstrip("\n"))
+            records.append(record)
+        self._stage(
+            "chunk",
+            "complete",
+            input_fingerprint=fingerprint,
+            artifacts=records,
+            terminal_ellipsis=terminal_ellipsis,
+            terminal_ellipsis_policy=TERMINAL_ELLIPSIS_POLICY,
+            terminal_ellipsis_replacements=terminal_ellipsis_replacements,
+        )
         return paths
 
     def _render(self, chunk_paths: list[Path]) -> list[Path]:
@@ -474,9 +526,17 @@ class ProjectPipeline:
             key: self.settings.get(key)
             for key in (
                 "tts_backend", "model", "voice", "language", "speed",
-                "reference_audio_project_path", "exaggeration", "cfg_weight", "temperature",
+                "reference_audio_project_path", "reference_text", "reference_profile_sha256",
+                "model_manifest_sha256", "exaggeration", "cfg_weight", "temperature",
+                "top_k", "top_p", "repetition_penalty",
+                "qwen_max_tokens", "qwen_min_wpm", "qwen_duration_margin_seconds",
+                "qwen_min_duration_seconds", "qwen_fallback_chars",
+                "qwen_max_fallback_depth", "qwen_fallback_pause_ms",
+                "terminal_ellipsis",
             )
         }
+        synthesis_settings["qwen_validation_policy"] = QWEN_VALIDATION_POLICY
+        synthesis_settings["fallback_policy"] = FALLBACK_POLICY
         settings_hash = stable_hash(synthesis_settings)
         wav_paths: list[Path] = []
         pending: list[tuple[int, Path, Path, str]] = []
@@ -506,21 +566,211 @@ class ProjectPipeline:
         backend = make_backend(self.settings)
         for index, chunk_path, wav_path, text_hash in pending:
             self._say(f"       speech chunk {index}/{len(chunk_paths)}")
-            temporary = wav_path.with_name(f".{wav_path.name}.rendering.wav")
-            temporary.unlink(missing_ok=True)
-            backend.render(chunk_path.read_text(encoding="utf-8"), temporary, self.settings)
-            os.replace(temporary, wav_path)
             chunk_id = f"{index:04d}"
+            text = chunk_path.read_text(encoding="utf-8")
+            fallback_audio = self.project_dir / f"audio/chunks/.fallback-{chunk_id}"
+            fallback_text = self.project_dir / f"text/fallback/{chunk_id}"
+            shutil.rmtree(fallback_audio, ignore_errors=True)
+            shutil.rmtree(fallback_text, ignore_errors=True)
+            failures: list[dict[str, Any]] = []
+            chunk_ledger[chunk_id] = {
+                "status": "rendering",
+                "text_sha256": text_hash,
+                "settings_sha256": settings_hash,
+                "validation_policy": QWEN_VALIDATION_POLICY,
+                "fallback_policy": FALLBACK_POLICY,
+                "started_at": utc_now(),
+            }
+            self._save()
+
+            def record_failure(failure: dict[str, Any]) -> None:
+                failures.append(failure)
+                chunk_ledger[chunk_id]["status"] = "fallback_in_progress"
+                chunk_ledger[chunk_id]["validation_failures"] = list(failures)
+                self._save()
+
+            render_record = self._render_with_fallback(
+                backend,
+                text,
+                wav_path,
+                chunk_id,
+                fallback_audio,
+                fallback_text,
+                record_failure,
+            )
+            shutil.rmtree(fallback_audio, ignore_errors=True)
             chunk_ledger[chunk_id] = {
                 "status": "complete",
                 "text_sha256": text_hash,
                 "settings_sha256": settings_hash,
                 "artifact": artifact(wav_path, self.project_dir),
+                "metrics": render_record["metrics"],
+                "validation_policy": QWEN_VALIDATION_POLICY,
+                "fallback_policy": FALLBACK_POLICY,
                 "completed_at": utc_now(),
             }
+            if failures:
+                chunk_ledger[chunk_id]["validation_failures"] = failures
+            if render_record.get("fallback"):
+                chunk_ledger[chunk_id]["fallback"] = render_record["fallback"]
+            if render_record.get("submitted_text_sha256"):
+                chunk_ledger[chunk_id]["submitted_text_sha256"] = render_record[
+                    "submitted_text_sha256"
+                ]
+            if render_record.get("text_transformations"):
+                chunk_ledger[chunk_id]["text_transformations"] = render_record[
+                    "text_transformations"
+                ]
             self._save()
         self._stage("render", "complete", settings_sha256=settings_hash)
         return wav_paths
+
+    @staticmethod
+    def _render_metrics_payload(result: object, output: Path, text: str) -> dict[str, Any]:
+        if isinstance(result, RenderMetrics):
+            return result.as_dict()
+        if isinstance(result, dict):
+            return dict(result)
+        payload = wav_metrics(output)
+        words = spoken_word_count(text)
+        duration = float(payload["duration_seconds"])
+        payload["word_count"] = words
+        payload["words_per_minute"] = round(words * 60.0 / duration, 3) if duration else None
+        return payload
+
+    def _render_with_fallback(
+        self,
+        backend: object,
+        text: str,
+        output: Path,
+        chunk_id: str,
+        fallback_audio_root: Path,
+        fallback_text_root: Path,
+        record_failure: Any,
+        *,
+        depth: int = 0,
+        branch: str = "root",
+    ) -> dict[str, Any]:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(f".{output.name}.rendering.wav")
+        temporary.unlink(missing_ok=True)
+        submitted_text = normalize_terminal_ellipsis(
+            text, self.settings.get("terminal_ellipsis", "preserve")
+        )
+        text_transformed = submitted_text != text
+        try:
+            result = backend.render(submitted_text, temporary, self.settings)
+            os.replace(temporary, output)
+            record = {
+                "metrics": self._render_metrics_payload(result, output, submitted_text),
+                "submitted_text_sha256": sha256_text(submitted_text),
+            }
+            if text_transformed:
+                record["text_transformations"] = [TERMINAL_ELLIPSIS_POLICY]
+            return record
+        except SpeechValidationError as exc:
+            temporary.unlink(missing_ok=True)
+            failure = exc.as_dict()
+            failure.update(
+                {
+                    "at": utc_now(),
+                    "branch": branch,
+                    "depth": depth,
+                    "characters": len(submitted_text.strip()),
+                    "text_sha256": sha256_text(submitted_text),
+                }
+            )
+            record_failure(failure)
+            if self.settings.get("tts_backend") != "qwen3":
+                raise
+            max_depth = int(self.settings.get("qwen_max_fallback_depth", 3))
+            if depth >= max_depth:
+                raise RuntimeError(
+                    f"Qwen speech validation failed after {max_depth} fallback levels "
+                    f"for chunk {chunk_id}: {exc}"
+                ) from exc
+
+            base_target = int(self.settings.get("qwen_fallback_chars", 600))
+            split_target = max(100, base_target // (2**depth))
+            parts = split_text_for_retry(submitted_text, split_target)
+            if len(parts) < 2:
+                raise RuntimeError(
+                    f"Qwen speech validation failed for chunk {chunk_id}, and its text "
+                    "cannot be split into a safer retry"
+                ) from exc
+
+            self._say(
+                f"       validation rejected {chunk_id}/{branch} ({exc.code}); "
+                f"retrying as {len(parts)} smaller sentence group(s)"
+            )
+            fallback_audio_root.mkdir(parents=True, exist_ok=True)
+            fallback_text_root.mkdir(parents=True, exist_ok=True)
+            child_paths: list[Path] = []
+            child_records: list[dict[str, Any]] = []
+            for part_index, part in enumerate(parts, 1):
+                part = normalize_terminal_ellipsis(
+                    part, self.settings.get("terminal_ellipsis", "preserve")
+                )
+                child_branch = f"{branch}.{part_index:04d}"
+                child_name = child_branch.replace("root.", "")
+                text_path = fallback_text_root / f"{child_name}.txt"
+                audio_path = fallback_audio_root / f"{child_name}.wav"
+                atomic_write_text(text_path, part)
+                child = self._render_with_fallback(
+                    backend,
+                    part,
+                    audio_path,
+                    chunk_id,
+                    fallback_audio_root,
+                    fallback_text_root,
+                    record_failure,
+                    depth=depth + 1,
+                    branch=child_branch,
+                )
+                child_paths.append(audio_path)
+                record = {
+                    "branch": child_branch,
+                    "text": artifact(text_path, self.project_dir),
+                    "characters": len(part.strip()),
+                    "metrics": child["metrics"],
+                }
+                if child.get("fallback"):
+                    record["fallback"] = child["fallback"]
+                if child.get("text_transformations"):
+                    record["text_transformations"] = child["text_transformations"]
+                child_records.append(record)
+
+            pause_ms = int(self.settings.get("qwen_fallback_pause_ms", 150))
+            combine_wavs(child_paths, temporary, pause_ms)
+            os.replace(temporary, output)
+            combined = wav_metrics(output)
+            words = spoken_word_count(text)
+            duration = float(combined["duration_seconds"])
+            combined.update(
+                {
+                    "word_count": words,
+                    "words_per_minute": round(words * 60.0 / duration, 3)
+                    if duration
+                    else None,
+                    "validation_policy": QWEN_VALIDATION_POLICY,
+                    "fallback_part_count": len(child_records),
+                }
+            )
+            for child_path in child_paths:
+                child_path.unlink(missing_ok=True)
+            record = {
+                "metrics": combined,
+                "submitted_text_sha256": sha256_text(submitted_text),
+                "fallback": {
+                    "trigger": failure,
+                    "split_target_chars": split_target,
+                    "pause_ms": pause_ms,
+                    "parts": child_records,
+                },
+            }
+            if text_transformed:
+                record["text_transformations"] = [TERMINAL_ELLIPSIS_POLICY]
+            return record
 
     def _assemble(self, wav_paths: list[Path]) -> Path:
         output = self.project_dir / "audio" / f"{self.config['project_name']}.mp3"

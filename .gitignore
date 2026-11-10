@@ -7,4 +7,11 @@ __pycache__/
 .pytest_cache/
 projects/*
 !projects/.gitkeep
+models/
+voice_projects/
+voice_references/
+curriculum/*
+!curriculum/.gitkeep
+workload/*
+!workload/.gitkeep
 

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
+from typing import Any
 
 
 def write_float_wav(path: Path, samples: object, sample_rate: int) -> None:
@@ -24,6 +25,21 @@ def write_float_wav(path: Path, samples: object, sample_rate: int) -> None:
         output.setsampwidth(2)
         output.setframerate(int(sample_rate))
         output.writeframes(pcm.tobytes())
+
+
+def wav_metrics(path: Path) -> dict[str, Any]:
+    with wave.open(str(path), "rb") as source:
+        if source.getcomptype() != "NONE":
+            raise RuntimeError(f"Compressed WAV is not supported: {path}")
+        sample_rate = source.getframerate()
+        frames = source.getnframes()
+        return {
+            "sample_rate": sample_rate,
+            "samples": frames,
+            "duration_seconds": round(frames / sample_rate, 3),
+            "channels": source.getnchannels(),
+            "sample_width": source.getsampwidth(),
+        }
 
 
 def combine_wavs(paths: list[Path], output: Path, pause_ms: int) -> None:

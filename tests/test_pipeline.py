@@ -7,8 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deterministic_tts.pdf import clean_pdf_body_pages
+from deterministic_tts.backends import RenderMetrics, SpeechValidationError, TestToneBackend
 from deterministic_tts.pipeline import ProjectPipeline, create_project
-from deterministic_tts.text import chunk_text, normalize_text
+from deterministic_tts.text import chunk_text, normalize_terminal_ellipsis, normalize_text
 from deterministic_tts.util import natural_key, sha256_file
 
 
@@ -24,6 +25,7 @@ def test_settings() -> dict[str, object]:
         "language": "a",
         "ocr_language": "en-US",
         "speed": 1.0,
+        "chunk_mode": "paragraph",
         "chunk_chars": 100,
         "pause_ms": 25,
         "mp3_bitrate": "64k",
@@ -76,8 +78,107 @@ class TextTests(unittest.TestCase):
         self.assertEqual(chunk_text(normalized, 100), chunk_text(normalized, 100))
         self.assertTrue(all(len(item.strip()) <= 100 for item in chunk_text(normalized, 100)))
 
+    def test_paragraph_mode_keeps_normal_paragraphs_separate(self) -> None:
+        source = "First short paragraph.\n\nSecond short paragraph."
+        self.assertEqual(
+            chunk_text(source, 100, mode="paragraph"),
+            ["First short paragraph.\n", "Second short paragraph.\n"],
+        )
+
+    def test_paragraph_mode_splits_only_oversized_paragraphs(self) -> None:
+        first = "A" * 80 + "."
+        second = "B" * 80 + "."
+        final = "A separate paragraph."
+        chunks = chunk_text(f"{first} {second}\n\n{final}", 100, mode="paragraph")
+        self.assertEqual(chunks, [first + "\n", second + "\n", final + "\n"])
+        self.assertTrue(all(len(item.strip()) <= 100 for item in chunks))
+
+    def test_terminal_ellipsis_is_replaced_only_at_request_end(self) -> None:
+        self.assertEqual(
+            normalize_terminal_ellipsis("Pause… then continue...\n", "period"),
+            "Pause… then continue.\n",
+        )
+        self.assertEqual(
+            normalize_terminal_ellipsis('Quoted ending…”\n', "period"),
+            'Quoted ending.”\n',
+        )
+        self.assertEqual(
+            normalize_terminal_ellipsis("Preserve...\n", "preserve"),
+            "Preserve...\n",
+        )
+
 
 class PipelineTests(unittest.TestCase):
+    def test_qwen_validation_failure_uses_sentence_fallback_and_records_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "story.txt"
+            source.write_text(
+                " ".join(
+                    f"Sentence {index} contains enough words for deterministic fallback."
+                    for index in range(1, 18)
+                ),
+                encoding="utf-8",
+            )
+            reference = root / "reference.wav"
+            reference.write_bytes(b"test reference")
+            settings = test_settings()
+            settings.update(
+                {
+                    "tts_backend": "qwen3",
+                    "chunk_chars": 2500,
+                    "qwen_fallback_chars": 180,
+                    "qwen_max_fallback_depth": 3,
+                    "qwen_fallback_pause_ms": 25,
+                }
+            )
+            project = create_project(
+                source,
+                root / "projects",
+                "fallback",
+                settings,
+                reference,
+                "Exact reference words.",
+            )
+
+            class RejectLongBackend:
+                def __init__(self) -> None:
+                    self.tone = TestToneBackend()
+
+                def render(self, text: str, output: Path, render_settings: dict):
+                    if len(text.strip()) > 180:
+                        raise SpeechValidationError(
+                            "token_limit",
+                            "simulated missing end-of-speech",
+                            RenderMetrics(
+                                sample_rate=24_000,
+                                samples=240_000,
+                                duration_seconds=10.0,
+                                word_count=len(text.split()),
+                                words_per_minute=60.0,
+                                token_count=100,
+                                max_tokens=100,
+                                allowed_duration_seconds=10.0,
+                                validation_policy="test",
+                            ),
+                        )
+                    return self.tone.render(text, output, render_settings)
+
+            with patch(
+                "deterministic_tts.pipeline.make_backend", return_value=RejectLongBackend()
+            ):
+                output = ProjectPipeline(project, progress=False).run()
+
+            self.assertTrue(output.is_file())
+            ledger = json.loads((project / "ledger.json").read_text(encoding="utf-8"))
+            chunk = ledger["chunks"]["0001"]
+            self.assertEqual(chunk["status"], "cleaned")
+            self.assertEqual(chunk["validation_failures"][0]["code"], "token_limit")
+            self.assertGreater(len(chunk["fallback"]["parts"]), 1)
+            self.assertGreater(chunk["metrics"]["fallback_part_count"], 1)
+            self.assertGreater(len(list((project / "text/fallback/0001").glob("*.txt"))), 1)
+            self.assertEqual(list((project / "audio").rglob("*.wav")), [])
+
     def test_pdf_embedded_text_resumes_at_first_unfinished_page(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

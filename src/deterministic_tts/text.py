@@ -6,6 +6,9 @@ import unicodedata
 from pathlib import Path
 
 
+TERMINAL_ELLIPSIS_POLICY = "terminal-ellipsis-to-period-v1"
+
+
 def decode_text_file(path: Path) -> str:
     data = path.read_bytes()
     if data.startswith(codecs.BOM_UTF8):
@@ -34,6 +37,18 @@ def normalize_text(value: str) -> str:
     return value.strip() + "\n"
 
 
+def normalize_terminal_ellipsis(value: str, mode: str = "preserve") -> str:
+    """Prevent a request-final ellipsis from instructing TTS to trail off."""
+    if mode not in {"period", "preserve"}:
+        raise ValueError(f"unsupported terminal ellipsis mode: {mode}")
+    if mode == "preserve":
+        return value
+    has_newline = value.endswith("\n")
+    core = value.rstrip()
+    core = re.sub(r"(?:\.{3,}|…+)([\"'”’\)\]]*)$", r".\1", core)
+    return core + ("\n" if has_newline else "")
+
+
 def _split_oversized(unit: str, target: int) -> list[str]:
     words = unit.split()
     if not words:
@@ -58,20 +73,19 @@ def _split_oversized(unit: str, target: int) -> list[str]:
     return output
 
 
-def chunk_text(value: str, target: int) -> list[str]:
-    if target < 100:
-        raise ValueError("chunk size must be at least 100 characters")
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", value) if part.strip()]
+def _sentence_units(paragraph: str, target: int) -> list[str]:
     units: list[str] = []
-    for paragraph in paragraphs:
-        sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s*\n\s*", " ", paragraph))
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if len(sentence) <= target:
-                units.append(sentence)
-            else:
-                units.extend(_split_oversized(sentence, target))
+    sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s*\n\s*", " ", paragraph))
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence) <= target:
+            units.append(sentence)
+        else:
+            units.extend(_split_oversized(sentence, target))
+    return units
 
+
+def _pack_units(units: list[str], target: int) -> list[str]:
     chunks: list[str] = []
     current = ""
     for unit in units:
@@ -83,5 +97,48 @@ def chunk_text(value: str, target: int) -> list[str]:
             current = candidate
     if current:
         chunks.append(current)
+    return chunks
+
+
+def chunk_text(value: str, target: int, mode: str = "target") -> list[str]:
+    if target < 100:
+        raise ValueError("chunk size must be at least 100 characters")
+    if mode not in {"paragraph", "target"}:
+        raise ValueError(f"unsupported chunk mode: {mode}")
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", value) if part.strip()]
+
+    if mode == "paragraph":
+        chunks: list[str] = []
+        for paragraph in paragraphs:
+            paragraph = re.sub(r"\s*\n\s*", " ", paragraph).strip()
+            if len(paragraph) <= target:
+                chunks.append(paragraph)
+            else:
+                chunks.extend(_pack_units(_sentence_units(paragraph, target), target))
+        return [chunk + "\n" for chunk in chunks]
+
+    units: list[str] = []
+    for paragraph in paragraphs:
+        units.extend(_sentence_units(paragraph, target))
+    chunks = _pack_units(units, target)
     return [chunk + "\n" for chunk in chunks]
+
+
+def split_text_for_retry(value: str, target: int) -> list[str]:
+    """Split a failed speech request deterministically into at least two pieces."""
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return []
+    pieces = [item.strip() for item in chunk_text(text, target, mode="target") if item.strip()]
+    if len(pieces) >= 2:
+        return [piece + "\n" for piece in pieces]
+
+    words = text.split()
+    if len(words) >= 2:
+        midpoint = len(words) // 2
+        return [" ".join(words[:midpoint]) + "\n", " ".join(words[midpoint:]) + "\n"]
+    if len(text) >= 2:
+        midpoint = len(text) // 2
+        return [text[:midpoint] + "\n", text[midpoint:] + "\n"]
+    return [text + "\n"]
 

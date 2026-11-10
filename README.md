@@ -3,6 +3,18 @@
 This repository provides a deterministic, resumable command-line workflow that
 turns plain text, PDFs, or ordered page images into one high-quality MP3.
 
+For DOCX curriculum, use the separate [curriculum preparation workflow](CURRICULUM_PREPARATION.md)
+and its [LLM editing instructions](CURRICULUM_LLM_INSTRUCTIONS.md) to preserve
+source paragraphs, add spoken transitions and verified ESV readings, and review
+table interpretations before producing the pipeline's plain-text input.
+Place DOCX files in `curriculum/` and run `.venv/bin/python prepare_curriculum.py`;
+ready documents export to `workload/<original-filename>.txt`, and a completion
+ledger in `curriculum/` prevents unchanged documents from being processed again.
+
+It also includes a separate permission-gated, offline voice-cloning workflow.
+See [Local Voice Cloning](VOICE_CLONING.md) for its assessment, model-download,
+reference preparation, synthesis, and resumption commands.
+
 It is designed for Apple Silicon Macs and uses:
 
 - [Apple Vision](https://developer.apple.com/documentation/vision) for local OCR.
@@ -29,6 +41,8 @@ have been downloaded, the OCR and speech pipeline can run offline.
 - Produces one normalized MP3 as the final audio output.
 - Deletes generated working WAV files after the MP3 is successfully verified.
 - Refuses to continue if a preserved project source has been modified.
+- Provides a separate `voice-clone` command with explicit consent, model-hash,
+  and offline-enforcement safeguards.
 
 ## Requirements
 
@@ -162,7 +176,7 @@ are not currently accepted directly; convert them to plain text or PDF first.
 | Ingest | Original inputs copied into `source/` | Copied files are hash-verified |
 | Extract | Decoded text or one text file per image/PDF page, with PDF margin cleanup | Completed pages are skipped |
 | Normalize | Unicode and whitespace cleanup | Reused while its input hash matches |
-| Chunk | Sentence-aware TTS chunks | Exact chunk text is preserved |
+| Chunk | Paragraph-first TTS chunks with bounded fallback splitting | Exact chunk text is preserved |
 | Render | One temporary PCM WAV per chunk | Completed chunks survive interruptions |
 | Assemble | Combined, normalized MP3 | Rebuilt only when required |
 | Cleanup | Generated WAV files removed | Runs only after MP3 verification |
@@ -385,7 +399,8 @@ disable all automatic margin removal, create the project with:
 | `--language` | `a` or `en` | TTS language code |
 | `--ocr-language` | `en-US` | OCR language identifier |
 | `--speed` | `1.0` | Kokoro speech speed, from `0.25` to `4.0` |
-| `--chunk-chars` | `350` | Target text size for a speech checkpoint |
+| `--chunk-mode` | `paragraph` | Keep each normal paragraph as one chunk; `target` restores legacy packing |
+| `--chunk-chars` | `2500` | Maximum chunk size; oversized paragraphs split at sentences, then words |
 | `--pause-ms` | `250` | Silence inserted between speech chunks |
 | `--mp3-bitrate` | `128k` | Final MP3 bitrate |
 | `--reference-audio PATH` | None | Required Chatterbox voice reference |
@@ -395,6 +410,28 @@ disable all automatic margin removal, create the project with:
 
 Run `.venv/bin/tts-project --help` for every available Chatterbox and model
 override option.
+
+Paragraph mode never combines adjacent paragraphs. A paragraph of at most 2,500
+characters is submitted as one speech request. A longer paragraph is split at
+sentence boundaries; only an individual overlong sentence is split at word
+boundaries. The accepted safety range is 100-3,000 characters. This is a
+pipeline safeguard, not a universal model character limit: speech models are
+ultimately limited by text tokens, generated audio tokens, available memory,
+and long-generation quality. Existing projects retain their frozen legacy
+chunk settings when resumed.
+
+For Qwen voice-clone projects, every generated chunk is validated before it is
+accepted. A request that reaches its audio-token budget or produces implausibly
+long audio is rejected and retried as deterministic sentence groups. The
+ledger preserves the failed attempt, duration/rate measurements, and fallback
+lineage; rejected audio is never assembled into the MP3. See
+[`VOICE_CLONING.md`](VOICE_CLONING.md#runaway-generation-protection) for the
+safety policy and reference-transcript requirements.
+
+Qwen voice-clone projects also convert an ellipsis at the end of a synthesis
+request into a period by default. This prevents `...` or `…` from producing a
+trailing-off delivery that can sound clipped. The normalized source remains
+unchanged, and `--terminal-ellipsis preserve` restores the literal behavior.
 
 ## Troubleshooting
 

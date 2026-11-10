@@ -19,6 +19,7 @@ local = [
 
 [project.scripts]
 tts-project = "deterministic_tts.cli:main"
+voice-clone = "deterministic_tts.voice_clone:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
